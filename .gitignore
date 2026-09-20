@@ -8,9 +8,13 @@ detections_*
 coverage_*.jpg
 undist_*.jpg
 errmap_*.jpg
+errcontour_*.png
+equidist_truth_*.png
 *.log
 
 intrinsics_*.json
+equidistant_*.json
+stability_*.json
 
 venv/
 __pycache__/

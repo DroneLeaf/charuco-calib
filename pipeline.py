@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""ChArUco intrinsics pipeline: detect -> pinhole + fisheye calibration -> FOV.
+"""ChArUco intrinsics pipeline: detect -> pinhole + fisheye calibration -> FOV -> report.
 
     venv/bin/python pipeline.py --video X.mp4 --tag 1440p
+
+Everything lands in intrinsics_<tag>.json: both models, FOV, validation in px and deg,
+board-pose spread, ray-map stability across folds, and the pure-equidistant check.
+--no-report stops after the fit and validation.
 
 Board: calib.io 8x11, checker 8 mm, marker 6 mm, DICT_4X4_50.
 NOTE the board is (squaresX=11, squaresY=8) with setLegacyPattern(True) -- the
@@ -9,6 +13,7 @@ naive (8,11)/non-legacy config detects almost nothing.
 """
 import cv2, numpy as np, os, sys, time, json, argparse
 from multiprocessing import Pool
+import error_contour, equidistant_check, ray_stability
 
 SQX, SQY = 11, 8
 # Physical sizes. These do NOT affect the intrinsics (K, D) -- they only set the
@@ -179,31 +184,15 @@ def select_views(recs, W, H, n_views, min_corners):
 
 
 def validate(recs, K, D, OBJP, fisheye):
-    errs, per = [], []
-    for r in recs:
-        if len(r[2]) < 8:
-            continue
-        o = OBJP[r[2]].reshape(-1, 1, 3)
-        ip = r[1].reshape(-1, 1, 2).astype(np.float64)
-        try:
-            if fisheye:
-                ok, rv, tv = cv2.fisheye.solvePnP(o.reshape(1, -1, 3), ip.reshape(1, -1, 2), K, D)
-                if not ok: continue
-                pr, _ = cv2.fisheye.projectPoints(o.reshape(1, -1, 3), rv, tv, K, D)
-            else:
-                ok, rv, tv = cv2.solvePnP(o.astype(np.float32), ip.astype(np.float32), K, D)
-                if not ok: continue
-                pr, _ = cv2.projectPoints(o, rv, tv, K, D)
-        except cv2.error:
-            continue
-        e = np.linalg.norm(pr.reshape(-1, 2) - ip.reshape(-1, 2), axis=1)
-        if not np.all(np.isfinite(e)) or e.mean() > 20:
-            continue
-        errs.append(e); per.append(np.sqrt((e ** 2).mean()))
-    a = np.concatenate(errs)
+    """solvePnP against every detected frame. Returns the summary for the JSON and the
+    per-corner residuals, which the error maps reuse rather than re-posing every frame."""
+    r = error_contour.residuals(recs, K, D, OBJP, fisheye, min_corners=8, max_frame_mean=20)
+    a, d = r["e_px"], r["e_deg"]
     return dict(rms=float(np.sqrt((a ** 2).mean())), mean=float(a.mean()),
                 median=float(np.median(a)), p95=float(np.percentile(a, 95)),
-                frames=len(per), points=int(len(a)))
+                rms_deg=float(np.sqrt((d ** 2).mean())), mean_deg=float(d.mean()),
+                median_deg=float(np.median(d)), p95_deg=float(np.percentile(d, 95)),
+                frames=r["frames"], points=int(len(a))), r
 
 
 def main():
@@ -215,6 +204,8 @@ def main():
     ap.add_argument("--min-corners", type=int, default=30)
     ap.add_argument("--detect-only", action="store_true",
                     help="detect + coverage report only, skip calibration")
+    ap.add_argument("--no-report", action="store_true",
+                    help="skip the stability folds, equidistant check and error maps")
     ap.add_argument("--square", type=float, default=0.008, help="checker size in metres")
     ap.add_argument("--marker", type=float, default=0.006, help="aruco marker size in metres")
     a = ap.parse_args()
@@ -312,11 +303,18 @@ def main():
               f"({dev*100:.0f}% apart) -- the polynomial fit has diverged. "
               f"Trust the fisheye result; check the coverage report for holes. ***")
 
-    vp = validate(recs, Kp, Dp.reshape(1, 5), OBJP, False)
-    vf = validate(recs, Kf, Df, OBJP, True)
+    vp, res_p = validate(recs, Kp, Dp.reshape(1, 5), OBJP, False)
+    vf, res_f = validate(recs, Kf, Df, OBJP, True)
     print(f"  validation over all detected frames:")
-    print(f"    pinhole RMS {vp['rms']:.4f}  mean {vp['mean']:.4f}  median {vp['median']:.4f}  ({vp['frames']} fr, {vp['points']} pts)")
-    print(f"    fisheye RMS {vf['rms']:.4f}  mean {vf['mean']:.4f}  median {vf['median']:.4f}  ({vf['frames']} fr, {vf['points']} pts)")
+    for n, v in (("pinhole", vp), ("fisheye", vf)):
+        print(f"    {n} RMS {v['rms']:.4f} px  mean {v['mean']:.4f}  median {v['median']:.4f}"
+              f"  | RMS {v['rms_deg']:.4f} deg  median {v['median_deg']:.4f}  ({v['frames']} fr, {v['points']} pts)")
+    tilt, dist = res_f["tilt"], res_f["dist"]
+    print(f"  board tilt from fronto-parallel: median {np.median(tilt):.1f}  p90 {np.percentile(tilt,90):.1f}  "
+          f"max {tilt.max():.1f} deg, {(tilt > 30).mean()*100:.0f}% of frames above 30"
+          f" | distance {dist.min():.2f}..{dist.max():.2f} m")
+    if np.percentile(tilt, 90) < 30:
+        print("  *** little board tilt: focal length is weakly constrained -- film 30-45 deg tilts. ***")
 
     # ---- FOV ----
     fx, fy, cx, cy = Kf[0, 0], Kf[1, 1], Kf[0, 2], Kf[1, 2]
@@ -386,11 +384,29 @@ def main():
                     "validation": vf},
         "fov_deg": {"h": hf, "v": vf_, "d": df, "h_centred": hc, "v_centred": vc,
                     "h_naive_pinhole": hp, "v_naive_pinhole": vp_},
+        "board_pose": {"tilt_deg": {"median": float(np.median(tilt)), "p90": float(np.percentile(tilt, 90)),
+                                    "max": float(tilt.max()), "frac_above_30": float((tilt > 30).mean())},
+                       "distance_m": {"min": float(dist.min()), "median": float(np.median(dist)),
+                                      "max": float(dist.max())}},
     }
-    json.dump(out, open(f"intrinsics_{a.tag}.json", "w"), indent=2, default=float)
+    dump = lambda: json.dump(out, open(f"intrinsics_{a.tag}.json", "w"), indent=2, default=float)
+    dump()                                   # the fit survives even if the report stage dies
     np.savez(f"calib_pinhole_{a.tag}.npz", K=Kp, D=Dp, size=np.array([W, H]))
     np.savez(f"calib_fisheye_{a.tag}.npz", K=Kf, D=Df, size=np.array([W, H]))
     print(f"\nwrote intrinsics_{a.tag}.json, calib_pinhole_{a.tag}.npz, calib_fisheye_{a.tag}.npz")
+    if a.no_report:
+        return
+
+    # ---- report: how far to trust it, and what a simpler model would cost ----
+    print(f"\n=== report {a.tag} ===")
+    out["stability"] = ray_stability.run(recs, Kf, Df, W, H, OBJP)
+    out["equidistant"] = equidistant_check.run(recs, Kf, Df, W, H, OBJP, a.tag)
+    try:
+        out["error_maps"] = error_contour.plot_maps({"fisheye": res_f, "pinhole": res_p}, W, H, a.tag, a.tag)
+    except ImportError:
+        print("  (matplotlib not installed -- error maps skipped)")
+    dump()
+    print(f"updated intrinsics_{a.tag}.json with stability, equidistant, error_maps")
 
 
 if __name__ == "__main__":

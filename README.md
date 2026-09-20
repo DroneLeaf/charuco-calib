@@ -52,11 +52,19 @@ venv/bin/pip install -r requirements.txt
 ```
 
 Needs OpenCV ≥ 4.7 for the current `CharucoDetector` API (developed against 5.0).
+matplotlib is only used for the report plots; without it the run still completes and
+skips them.
 
 ## Run
 
 ```bash
 venv/bin/python pipeline.py --video clip_1440p.mp4 --tag 1440p --square 0.008 --marker 0.006
+```
+
+For a larger board, e.g. 33 mm squares with 24 mm markers, filmed at 720p:
+
+```bash
+venv/bin/python pipeline.py --video clip_720p.mp4 --tag 720p --square 0.033 --marker 0.024
 ```
 
 Everything is keyed by `--tag`, so one tag carries through the whole toolchain.
@@ -68,10 +76,37 @@ A pass writes:
 | `frames_<tag>/` | JPEGs of every frame the board was found in |
 | `coverage_<tag>.jpg` | where in the image plane corners were actually observed |
 | `calib_pinhole_<tag>.npz`, `calib_fisheye_<tag>.npz` | `K`, `D`, `size` |
-| `intrinsics_<tag>.json` | both models, FOV, validation stats, model-validity flags |
+| `intrinsics_<tag>.json` | **everything**: both models, FOV, validation in px and deg, board-pose spread, ray-map stability, the pure-equidistant check, plot file names |
+| `errcontour_<tag>.png`, `errcontour_<tag>_deg.png` | reprojection error across the image, in px and in degrees |
+| `equidist_truth_<tag>.png`, `calib_fisheye_<tag>-equidist.npz` | what dropping the distortion polynomial would cost (see below) |
 
-Useful flags: `--detect-only` (detection + coverage report, no fit), `--views` (how many
-views to select, default 500), `--nproc`, `--min-corners`.
+Useful flags: `--detect-only` (detection + coverage report, no fit), `--no-report` (stop
+after fit + validation; skips the stability folds, equidistant check and plots), `--views`
+(how many views to select, default 500), `--nproc`, `--min-corners`.
+
+**Several clips of the same camera:** concatenate them and calibrate the result as one
+video. Same codec/resolution/fps concatenates without re-encoding:
+
+```bash
+printf "file '%s'\n" "$PWD"/clip_a.mp4 "$PWD"/clip_b.mp4 > list.txt
+ffmpeg -f concat -safe 0 -i list.txt -c copy clip_merged.mp4
+```
+
+### What is in `intrinsics_<tag>.json`
+
+| key | contents |
+|---|---|
+| `pinhole`, `fisheye` | `fx fy cx cy`, `dist`, calibration RMS, and `validation` over every detected frame — `rms/mean/median/p95` in px and the same with a `_deg` suffix in degrees. `fisheye` is OpenCV's model: equidistant **plus** a `k1..k4` polynomial, not a pure `r = f·θ` lens. |
+| `fov_deg` | measured, centred-convention and naive-pinhole FOV |
+| `board_pose` | board tilt from fronto-parallel and distance across the clip. Little tilt (p90 under ~30°) leaves focal length weakly constrained; the run warns. |
+| `stability` | four interleaved folds calibrated independently, compared as pixel→ray maps. `fold_to_fold_deg` is statistical noise; `fold_vs_main_deg` and `fx.fold_vs_main_pct` are what a different choice of views does to the answer. `systematic: true` means the second dominates — the angular scale is only known to about that percentage, and more footage of the same kind will not help. |
+| `equidistant` | the pure equidistant model (`fx = fy`, no polynomial) and its **true pointing error** against the full model, three ways: `fitted` (what a pure-equidistant calibration returns — typically a badly wrong focal hiding behind a low RMS), `paraxial` (focal taken from the full model), `best_single_focal` (the one to use if a pure model is unavoidable). |
+| `error_maps` | the two contour plot file names |
+
+Reprojection RMS is not a pointing accuracy. With free board poses the solver can buy a
+low RMS for a wrong projection law by moving focal length and board distance together —
+on one 57° lens a pure equidistant fit reprojected to 1.6 px while pointing 7° off. The
+`stability` and `equidistant` sections exist because of that: they compare ray maps.
 
 ### Filming the clip
 
@@ -144,6 +179,9 @@ that the coverage report shows data near all four corners.
    reporting RMS / mean / median / p95.
 6. **FOV** — inverts the fisheye θ(r) numerically and measures the angle between edge rays.
    Also prints the centred convention and the naive pinhole number for comparison.
+7. **Report** — ray-map stability across folds, the pure-equidistant check, and the error
+   contour maps (reusing the validation residuals, so no frame is posed twice). Adds roughly
+   ten fisheye fits on ~470 views each; `--no-report` skips it.
 
 ### Guards worth knowing about
 
@@ -170,6 +208,9 @@ Each answers one specific question that came up while calibrating.
 |---|---|
 | `refine_all.py` | Refine intrinsics against **every** detected frame, not 500 views. Joint LM over 4000 views is a 24018² system and runs for days; poses are conditionally independent given the intrinsics, so it alternates pose-solve / Gauss–Newton on the 9 intrinsics instead. Same optimum, linear in frames. Writes `*_all.npz`. |
 | `verify.py` | Coverage map, empirical θ(r) vs both models, undistorted sample frames. |
+| `error_contour.py` | Re-plot the px / deg error contour maps from saved artefacts; `--calib-tag <tag>-equidist --models fisheye` maps the pure-equidistant fit instead. Run by the pipeline. |
+| `equidistant_check.py` | Can the lens be treated as pure `r = f·θ`? Run by the pipeline; standalone it writes `equidistant_<tag>.json`. |
+| `ray_stability.py` | Do independent folds agree on the pixel→ray map, and with the main fit? Run by the pipeline; standalone it writes `stability_<tag>.json`. |
 | `error_distribution.py` | Reprojection error magnitude *and* where in the frame it lands, pinhole vs fisheye. |
 | `pp_uncertainty.py` | Is the principal-point offset real or fit noise? K interleaved folds calibrated independently; compare the spread to the measured offset. |
 | `angle_consistency.py` | Do two calibrations describe the same optics? The angle between two 3D rays is rotation-invariant, so matched features across two clips must give the same angular separation through either calibration. A wrong focal length shows up as a fixed factor. |
