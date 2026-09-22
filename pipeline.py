@@ -4,7 +4,7 @@
     venv/bin/python pipeline.py --video X.mp4 --tag 1440p
 
 Everything lands in intrinsics_<tag>.json: both models, FOV, validation in px and deg,
-board-pose spread, ray-map stability across folds, and the pure-equidistant check.
+board-pose spread, and the leaf-tracker bearing model fitted to the lens.
 --no-report stops after the fit and validation.
 
 Board: calib.io 8x11, checker 8 mm, marker 6 mm, DICT_4X4_50.
@@ -13,7 +13,7 @@ naive (8,11)/non-legacy config detects almost nothing.
 """
 import cv2, numpy as np, os, sys, time, json, argparse
 from multiprocessing import Pool
-import error_contour, equidistant_check, ray_stability
+import error_contour, azel_model_check
 
 SQX, SQY = 11, 8
 # Physical sizes. These do NOT affect the intrinsics (K, D) -- they only set the
@@ -205,7 +205,7 @@ def main():
     ap.add_argument("--detect-only", action="store_true",
                     help="detect + coverage report only, skip calibration")
     ap.add_argument("--no-report", action="store_true",
-                    help="skip the stability folds, equidistant check and error maps")
+                    help="skip the bearing-model fit and error maps")
     ap.add_argument("--square", type=float, default=0.008, help="checker size in metres")
     ap.add_argument("--marker", type=float, default=0.006, help="aruco marker size in metres")
     a = ap.parse_args()
@@ -234,17 +234,37 @@ def main():
     def pinhole_staged(op, ip, K_init=None):
         """Release parameters gradually. Fitting all 5 distortion terms plus a free
         principal point from a cold start lets the polynomial run away when edge
-        coverage is thin (observed: fx diverging to 2496 on the merged 1440p set)."""
+        coverage is thin (observed: fx diverging to 2496 on the merged 1440p set).
+
+        A stage that frees the principal point can still walk it off the sensor, and
+        OpenCV then raises "Principal point must be within the image" and kills the run
+        (observed on the 12 mm clip, whose top edge is thinly covered). Each stage is
+        therefore retried with the principal point pinned, and failing that the previous
+        stage's result stands -- a slightly under-released fit beats no fit at all."""
         K = (K_init.copy() if K_init is not None
              else np.array([[0.5 * W, 0, W / 2], [0, 0.5 * W, H / 2], [0, 0, 1]], float))
         D = np.zeros(14)
         G = cv2.CALIB_USE_INTRINSIC_GUESS
+        margin = 0.15                      # keep the principal point this far inside the frame
+        inside = lambda M: (margin * W < M[0, 2] < (1 - margin) * W
+                            and margin * H < M[1, 2] < (1 - margin) * H)
         for fl in (G | cv2.CALIB_FIX_PRINCIPAL_POINT | cv2.CALIB_ZERO_TANGENT_DIST
                    | cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3,
                    G | cv2.CALIB_ZERO_TANGENT_DIST | cv2.CALIB_FIX_K3,
                    G | cv2.CALIB_FIX_K3,
                    G):
-            _, K, D, *_ = cv2.calibrateCamera(op, ip, (W, H), K, D, flags=fl, criteria=crit)
+            for attempt in (fl, fl | cv2.CALIB_FIX_PRINCIPAL_POINT):
+                try:
+                    _, Kn, Dn, *_ = cv2.calibrateCamera(op, ip, (W, H), K.copy(), D.copy(),
+                                                        flags=attempt, criteria=crit)
+                except cv2.error:
+                    continue
+                if not (np.all(np.isfinite(Kn)) and np.all(np.isfinite(Dn)) and inside(Kn)):
+                    continue
+                K, D = Kn, Dn
+                break
+            else:
+                print(f"    (pinhole stage {fl:#x} unusable -- keeping the previous stage)")
         return K, D
 
     COLD = np.array([[0.5 * W, 0, W / 2], [0, 0.5 * W, H / 2], [0, 0, 1]], float)
@@ -273,11 +293,49 @@ def main():
         print("    *** fisheye calibration failed on all subsets ***")
         return float("nan"), COLD.copy(), np.zeros((4, 1)), None, None
 
+    def drop_outlier_views(idxs, K, D, pct=92):
+        """Views whose own solvePnP pose does not fit the provisional intrinsics. View
+        selection is greedy for image coverage, so it actively favours frames where the
+        board reaches the frame edge at a steep angle -- the most informative views and
+        also the most often mis-detected. On the 12 mm clip a handful of them (10-25
+        corners, degenerate poses, per-frame RMS up to 4.8e5 px) dragged the seed fit to
+        RMS 3.9 while uniformly sampled halves of the same clip fitted to 0.7-0.9."""
+        e = []
+        for i in idxs:
+            o = OBJP[recs[i][2]].reshape(1, -1, 3)
+            p = recs[i][1].reshape(1, -1, 2).astype(np.float64)
+            try:
+                ok, rv, tv = cv2.fisheye.solvePnP(o, p, K, np.asarray(D, np.float64).reshape(4, 1))
+                pr, _ = cv2.fisheye.projectPoints(o, rv, tv, K, np.asarray(D, np.float64).reshape(4, 1))
+                r = np.sqrt(((pr.reshape(-1, 2) - p.reshape(-1, 2)) ** 2).sum(1).mean()) if ok else np.inf
+            except cv2.error:
+                r = np.inf
+            e.append(r if np.isfinite(r) else np.inf)
+        e = np.asarray(e)
+        fin = e[np.isfinite(e)]
+        if len(fin) < 20:
+            return np.asarray(idxs), e
+        # a fixed percentile alone cannot cope with a long tail; also cut anything far
+        # above the bulk, so a good clip loses nothing and a spiky one loses the spikes
+        thr = max(np.percentile(fin, pct), 3.0 * np.median(fin))
+        keep = np.asarray(idxs)[e <= thr]
+        return (keep if len(keep) >= 20 else np.asarray(idxs)), e
+
     # ---- fisheye FIRST: it stays well conditioned at wide FOV even with coverage
     # holes, so its K is a far better seed for the polynomial fit than 0.5*W.
     # (Seeding the pinhole cold made fx run away to 419 on a clip missing the top
     # of frame -- 23.9 deg angular residual, silently reported as a normal result.)
     rms_f0, Kf0, Df0, _, _ = fisheye_fit(sel)
+    # ...then re-seed on the views that fit it, so a few bad detections cannot poison
+    # every stage downstream (the pinhole rounds below reject outliers of their own,
+    # but only after the staged fit has already been built on the bad seed).
+    clean, ev = drop_outlier_views(sel, Kf0, Df0)
+    if len(clean) < len(sel):
+        rms_f1, Kf1, Df1, _, _ = fisheye_fit(clean)
+        print(f"  seed: dropped {len(sel)-len(clean)}/{len(sel)} views as outliers "
+              f"(worst {np.max(ev[np.isfinite(ev)]):.1f} px), RMS {rms_f0:.4f} -> {rms_f1:.4f}")
+        if np.isfinite(rms_f1) and rms_f1 < rms_f0:
+            sel, Kf0, Df0 = clean, Kf1, Df1
 
     # ---- pinhole, 2 rounds with outlier rejection, seeded from fisheye ----
     op, ip = build(sel)
@@ -397,16 +455,15 @@ def main():
     if a.no_report:
         return
 
-    # ---- report: how far to trust it, and what a simpler model would cost ----
+    # ---- report: the tracker's bearing model fitted to this lens, and where the error sits ----
     print(f"\n=== report {a.tag} ===")
-    out["stability"] = ray_stability.run(recs, Kf, Df, W, H, OBJP)
-    out["equidistant"] = equidistant_check.run(recs, Kf, Df, W, H, OBJP, a.tag)
+    out["bearing_model"] = azel_model_check.run(Kf, Df, W, H, a.tag)
     try:
         out["error_maps"] = error_contour.plot_maps({"fisheye": res_f, "pinhole": res_p}, W, H, a.tag, a.tag)
     except ImportError:
         print("  (matplotlib not installed -- error maps skipped)")
     dump()
-    print(f"updated intrinsics_{a.tag}.json with stability, equidistant, error_maps")
+    print(f"updated intrinsics_{a.tag}.json with bearing_model, error_maps")
 
 
 if __name__ == "__main__":

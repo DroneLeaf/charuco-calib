@@ -3,7 +3,7 @@
 once in pixels and once in degrees. pipeline.py runs this at the end of every pass; the
 CLI is for re-plotting from saved artefacts.
 
-    venv/bin/python error_contour.py --tag 40deg --square 0.033 --marker 0.024
+    venv/bin/python error_contour.py --tag 8mm --square 0.033 --marker 0.024
 
 The angular error is the angle between the ray through the detected corner (unprojected
 through the model) and the ray to the board corner itself (R*X + t). It is not px times a
@@ -148,7 +148,7 @@ def main():
     ap.add_argument("--marker", type=float, default=0.011)
     ap.add_argument("--calib-tag", default=None,
                     help="read calib_<model>_<calib-tag>.npz instead of the detections' tag, "
-                         "e.g. 40deg-equidist from equidistant_check.py")
+                         "e.g. 8mm-equidist from equidistant_check.py")
     ap.add_argument("--models", default="fisheye,pinhole")
     ap.add_argument("--min-corners", type=int, default=12)
     ap.add_argument("--cell", type=int, default=20, help="bin size in px")

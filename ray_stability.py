@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""How far can the pixel -> ray map be trusted? pipeline.py runs this at the end of every
-pass and stores the result under "stability" in intrinsics_<tag>.json.
+"""How far can the pixel -> ray map be trusted? Standalone; writes stability_<tag>.json.
 
-    venv/bin/python ray_stability.py --tag 40deg --square 0.033 --marker 0.024
+    venv/bin/python ray_stability.py --tag 8mm --square 0.033 --marker 0.024
 
 Reprojection RMS does not answer this: fits whose RMS agrees to 0.001 px have disagreed
 on focal length by 1-1.5% here, because focal length trades against board distance and

@@ -76,12 +76,12 @@ A pass writes:
 | `frames_<tag>/` | JPEGs of every frame the board was found in |
 | `coverage_<tag>.jpg` | where in the image plane corners were actually observed |
 | `calib_pinhole_<tag>.npz`, `calib_fisheye_<tag>.npz` | `K`, `D`, `size` |
-| `intrinsics_<tag>.json` | **everything**: both models, FOV, validation in px and deg, board-pose spread, ray-map stability, the pure-equidistant check, plot file names |
+| `intrinsics_<tag>.json` | **everything**: both models, FOV, validation in px and deg, board-pose spread, the leaf-tracker bearing model fitted to the lens, plot file names |
 | `errcontour_<tag>.png`, `errcontour_<tag>_deg.png` | reprojection error across the image, in px and in degrees |
-| `equidist_truth_<tag>.png`, `calib_fisheye_<tag>-equidist.npz` | what dropping the distortion polynomial would cost (see below) |
+| `azel_truth_<tag>.png` | pointing error left by the leaf-tracker bearing model once fitted to this lens (see below) |
 
 Useful flags: `--detect-only` (detection + coverage report, no fit), `--no-report` (stop
-after fit + validation; skips the stability folds, equidistant check and plots), `--views`
+after fit + validation; skips the bearing-model fit and plots), `--views`
 (how many views to select, default 500), `--nproc`, `--min-corners`.
 
 **Several clips of the same camera:** concatenate them and calibrate the result as one
@@ -99,14 +99,13 @@ ffmpeg -f concat -safe 0 -i list.txt -c copy clip_merged.mp4
 | `pinhole`, `fisheye` | `fx fy cx cy`, `dist`, calibration RMS, and `validation` over every detected frame — `rms/mean/median/p95` in px and the same with a `_deg` suffix in degrees. `fisheye` is OpenCV's model: equidistant **plus** a `k1..k4` polynomial, not a pure `r = f·θ` lens. |
 | `fov_deg` | measured, centred-convention and naive-pinhole FOV |
 | `board_pose` | board tilt from fronto-parallel and distance across the clip. Little tilt (p90 under ~30°) leaves focal length weakly constrained; the run warns. |
-| `stability` | four interleaved folds calibrated independently, compared as pixel→ray maps. `fold_to_fold_deg` is statistical noise; `fold_vs_main_deg` and `fx.fold_vs_main_pct` are what a different choice of views does to the answer. `systematic: true` means the second dominates — the angular scale is only known to about that percentage, and more footage of the same kind will not help. |
-| `equidistant` | the pure equidistant model (`fx = fy`, no polynomial) and its **true pointing error** against the full model, three ways: `fitted` (what a pure-equidistant calibration returns — typically a badly wrong focal hiding behind a low RMS), `paraxial` (focal taken from the full model), `best_single_focal` (the one to use if a pure model is unavoidable). |
+| `bearing_model` | the leaf-tracker az/el model (`angles.compute_los` + compensating angles; twist 0, optical-centre offsets 0; x up, y right, +rot toward the top-left) fitted to this lens: `hfov_deg`, `vfov_deg`, `rot_around_x_compensating_angle_deg`, `rot_around_y_compensating_angle_deg` to paste into the tracker config, the `deg_per_px` they imply, and the **true pointing error** that model is left with against the full calibration. hfov / vfov are fitted independently and come out anisotropic on a lens that compresses toward its edges; `isotropic_alternative` is the best single-deg/px pair. |
 | `error_maps` | the two contour plot file names |
 
 Reprojection RMS is not a pointing accuracy. With free board poses the solver can buy a
 low RMS for a wrong projection law by moving focal length and board distance together —
 on one 57° lens a pure equidistant fit reprojected to 1.6 px while pointing 7° off. The
-`stability` and `equidistant` sections exist because of that: they compare ray maps.
+`bearing_model` error is therefore a comparison of pixel→ray maps, not a residual.
 
 ### Filming the clip
 
@@ -179,9 +178,9 @@ that the coverage report shows data near all four corners.
    reporting RMS / mean / median / p95.
 6. **FOV** — inverts the fisheye θ(r) numerically and measures the angle between edge rays.
    Also prints the centred convention and the naive pinhole number for comparison.
-7. **Report** — ray-map stability across folds, the pure-equidistant check, and the error
-   contour maps (reusing the validation residuals, so no frame is posed twice). Adds roughly
-   ten fisheye fits on ~470 views each; `--no-report` skips it.
+7. **Report** — the leaf-tracker bearing model fitted to the lens (seconds: it fits ray
+   maps, no calibration reruns) and the error contour maps (reusing the validation
+   residuals, so no frame is posed twice). `--no-report` skips it.
 
 ### Guards worth knowing about
 
@@ -189,6 +188,17 @@ that the coverage report shows data near all four corners.
   warns loudly. This is a real failure mode: seeding the pinhole cold on a clip missing the
   top of frame drove `fx` to 419 and produced a 23.9° angular residual that otherwise
   reported as a perfectly normal result.
+- **Outlier views poison the seed.** View selection is greedy for image coverage, so it
+  favours frames where the board reaches the frame edge at a steep angle — the most
+  informative views, and the most often mis-detected. The fisheye seed fit is therefore
+  re-run on the views that fit it (percentile *and* a multiple-of-median cut, so a clean
+  clip loses nothing). On the 12 mm clip 35 of 500 views, worst 1.1e2 px, took the seed
+  from RMS 3.93 to 0.69 and the final fit to 0.59; uniformly sampled halves of the same
+  clip had always fitted to 0.7–0.9, which is what gave the cause away.
+- **Principal point walking off the sensor.** A staged pinhole fit that frees the
+  principal point can push it outside the image, and OpenCV then raises
+  `Principal point must be within the image` and kills the run. Each stage is retried
+  with the principal point pinned, and failing that the previous stage's result stands.
 - **Polynomial invertibility.** The run checks how far out in normalised radius the pinhole
   distortion polynomial stays monotonic and compares that to what the image corners need.
   `CORNERS OUTSIDE MODEL` means the pinhole model is undefined there.
@@ -209,8 +219,9 @@ Each answers one specific question that came up while calibrating.
 | `refine_all.py` | Refine intrinsics against **every** detected frame, not 500 views. Joint LM over 4000 views is a 24018² system and runs for days; poses are conditionally independent given the intrinsics, so it alternates pose-solve / Gauss–Newton on the 9 intrinsics instead. Same optimum, linear in frames. Writes `*_all.npz`. |
 | `verify.py` | Coverage map, empirical θ(r) vs both models, undistorted sample frames. |
 | `error_contour.py` | Re-plot the px / deg error contour maps from saved artefacts; `--calib-tag <tag>-equidist --models fisheye` maps the pure-equidistant fit instead. Run by the pipeline. |
-| `equidistant_check.py` | Can the lens be treated as pure `r = f·θ`? Run by the pipeline; standalone it writes `equidistant_<tag>.json`. |
-| `ray_stability.py` | Do independent folds agree on the pixel→ray map, and with the main fit? Run by the pipeline; standalone it writes `stability_<tag>.json`. |
+| `azel_model_check.py` | Fit the leaf-tracker bearing model to a saved calibration and update `bearing_model` in `intrinsics_<tag>.json`. Run by the pipeline. |
+| `equidistant_check.py` | Can the lens be treated as pure radial `r = f·θ`? Not part of the pipeline; writes `equidistant_<tag>.json`. |
+| `ray_stability.py` | Do independent folds agree on the pixel→ray map, and with the main fit? Fold-to-fold is statistical noise; fold-vs-main is what a different choice of views does to the answer. Not part of the pipeline; writes `stability_<tag>.json`. |
 | `error_distribution.py` | Reprojection error magnitude *and* where in the frame it lands, pinhole vs fisheye. |
 | `pp_uncertainty.py` | Is the principal-point offset real or fit noise? K interleaved folds calibrated independently; compare the spread to the measured offset. |
 | `angle_consistency.py` | Do two calibrations describe the same optics? The angle between two 3D rays is rotation-invariant, so matched features across two clips must give the same angular separation through either calibration. A wrong focal length shows up as a fixed factor. |

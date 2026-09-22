@@ -10,10 +10,12 @@ undist_*.jpg
 errmap_*.jpg
 errcontour_*.png
 equidist_truth_*.png
+azel_truth_*.png
 *.log
 
 intrinsics_*.json
 equidistant_*.json
+azel_*.json
 stability_*.json
 
 venv/

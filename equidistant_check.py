@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Can this lens be treated as a pure equidistant camera -- r = f*theta, fx = fy, no polynomial?
-pipeline.py runs this at the end of every pass and stores the result under "equidistant"
-in intrinsics_<tag>.json; the CLI re-runs it from saved artefacts.
+Standalone; not part of the pipeline (the tracker's own model is azel_model_check.py).
 
-    venv/bin/python equidistant_check.py --tag 40deg --square 0.033 --marker 0.024
+    venv/bin/python equidistant_check.py --tag 8mm --square 0.033 --marker 0.024
 
 Reprojection error alone cannot answer this. With free board poses the solver buys a low
 RMS for a wrong projection law by moving the focal length and the board distances
@@ -91,13 +90,14 @@ def run(recs, K0, D0, W, H, OBJP, tag, views=470, plot=True):
     }
     if plot:
         try:
-            out["files"].append(_plot(variants, us, vs, W, H, K0, tag))
+            out["files"].append(_plot(variants, us, vs, W, H, K0, f"equidist_truth_{tag}.png",
+                                      f"True angular error of a pure equidistant model — {tag} ({W}×{H})"))
         except ImportError:
             print("    (matplotlib not installed -- equidist_truth plot skipped)")
     return out
 
 
-def _plot(variants, us, vs, W, H, K0, tag):
+def _plot(variants, us, vs, W, H, K0, out, title, prefix="pure equidistant, "):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -107,7 +107,9 @@ def _plot(variants, us, vs, W, H, K0, tag):
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10, "text.color": INK,
                          "axes.edgecolor": MUTED, "axes.labelcolor": MUTED,
                          "xtick.color": MUTED, "ytick.color": MUTED})
-    fig, axes = plt.subplots(3, 1, figsize=(10, 16.2), facecolor=SURFACE, sharex=True)
+    n = len(variants)
+    fig, axes = plt.subplots(n, 1, figsize=(10, 0.6 + 5.2 * n), facecolor=SURFACE, sharex=True)
+    axes = np.atleast_1d(axes)
     for ax, (name, desc, e) in zip(axes, variants):
         g = e.reshape(us.shape)
         step = [s for s in (0.05, 0.1, 0.2, 0.25, 0.5, 1, 2, 5) if g.max() / s <= 12][0]
@@ -122,7 +124,7 @@ def _plot(variants, us, vs, W, H, K0, tag):
                   colors=[INK if v < mid else SURFACE for v in cl.levels])
         ax.plot(K0[0, 2], K0[1, 2], "+", color=INK, ms=11, mew=1.6)
         ax.set_xlim(0, W); ax.set_ylim(H, 0); ax.set_aspect("equal"); ax.set_ylabel("v (px)")
-        ax.set_title(f"pure equidistant, {desc}", loc="left", fontsize=11.5, fontweight="bold", color=INK, pad=20)
+        ax.set_title(f"{prefix}{desc}", loc="left", fontsize=11.5, fontweight="bold", color=INK, pad=20)
         ax.text(0, 1.025, f"pointing error  mean {e.mean():.2f}°   p95 {np.percentile(e,95):.2f}°   max {e.max():.2f}°"
                 f"   ≈ {np.radians(e.mean())*K0[0,0]:.0f} px mean, {np.radians(e.max())*K0[0,0]:.0f} px max",
                 transform=ax.transAxes, fontsize=9, color=MUTED)
@@ -131,12 +133,11 @@ def _plot(variants, us, vs, W, H, K0, tag):
         cb = fig.colorbar(cf, ax=ax, ticks=levels, format=fmt, fraction=0.025, pad=0.02)
         cb.set_label("pointing error (deg)", color=INK); cb.outline.set_visible(False)
     axes[-1].set_xlabel("u (px)")
-    fig.suptitle(f"True angular error of a pure equidistant model — {tag} ({W}×{H})",
-                 x=0.07, ha="left", fontsize=14, fontweight="bold", color=INK)
-    fig.text(0.07, 0.012, "angle between the ray each pure model assigns to a pixel and the ray from the full "
+    fig.suptitle(title, x=0.07, ha="left", fontsize=14, fontweight="bold", color=INK)
+    fig.text(0.07, 0.2 / (0.6 + 5.2 * n), "angle between the ray each model assigns to a pixel and the ray from the full "
              "calibration; each panel has its own scale", fontsize=8.5, color=MUTED)
-    fig.subplots_adjust(left=0.07, right=0.93, top=0.93, bottom=0.05, hspace=0.22)
-    out = f"equidist_truth_{tag}.png"
+    fig.subplots_adjust(left=0.07, right=0.93, top=1 - 1.15 / (0.6 + 5.2 * n),
+                        bottom=0.8 / (0.6 + 5.2 * n), hspace=0.22)
     fig.savefig(out, dpi=150, facecolor=SURFACE)
     plt.close(fig)
     print(f"    wrote {out}")
